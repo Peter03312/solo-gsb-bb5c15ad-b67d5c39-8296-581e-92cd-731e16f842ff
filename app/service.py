@@ -75,6 +75,21 @@
 - cue 按 (start_ms, clip_index, seq) 升序返回；format=vtt 时渲染为
   合法 WebVTT，正文转义 & < >。
 
+快照字幕引用迁移（migrate_snapshot_quote）不变式：
+- 迁移是纯只读计算：只读取两个快照的 snapshot_items（冻结生效文本），
+  快照表与定稿 / 更正原表均不被修改；
+- 仅允许同频道的两个既有快照：任一快照不存在 -> 404，频道不一致
+  -> 409；
+- 源引用区间 [start_seq, end_seq]（含两端）必须落在源快照内，且区间
+  内不得有缺口、不得有空洞；起止码点偏移（左闭右开）必须落在对应
+  字幕文本的码点边界内，且提取出的引用必须非空，否则 422
+  invalid_quote_range；
+- 引用可跨越相邻（同段、中间无缺口）字幕；中间字幕为空时仍属于
+  同一连续段，引用照常跨段；
+- 在目标快照的连续字幕文本（相邻字幕无分隔拼接、缺口阻断）中逐码点
+  枚举引用的全部出现：恰好一次 -> found 并返回对应起止序号 / 偏移；
+  零次 -> missing；多次 -> ambiguous（绝不任选一个位置）。
+
 命名消费者拉取游标（consumers）不变式：
 - 每个 (channel, consumer) 的 cursor 只能经确认接口单调推进，且只能
   推进到当前租约批次 [lease_from, lease_to] 内的序号；
@@ -1488,6 +1503,243 @@ def _vtt_timestamp(ms: int) -> str:
 def _escape_vtt_text(text: str) -> str:
     """WebVTT 正文转义：& < > 替换为实体，避免被解析为标记或时间戳箭头。"""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# ---------- 快照字幕引用迁移 ----------
+
+
+def migrate_snapshot_quote(
+    source_snapshot_id: str,
+    target_snapshot_id: str,
+    start_seq: int,
+    start_offset: int,
+    end_seq: int,
+    end_offset: int,
+) -> dict:
+    """把源快照中的一段非空引用迁移定位到目标快照（纯只读，不修改任何状态）。
+
+    引用区间按 [start_seq, end_seq]（含两端）+ 起止字幕内码点偏移
+    （左闭右开）给定，按源快照冻结的生效文本提取：引用可跨越相邻
+    （中间无缺口）字幕，但不得越过缺口；序号 / 偏移无效或引用为空均
+    以 422 invalid_quote_range 拒绝。随后在同频道目标快照的连续字幕
+    文本中逐码点查找完整引用（相邻字幕无分隔拼接、缺口阻断）：恰好
+    一次返回 found 及对应起止序号 / 偏移；零次返回 missing；多次返回
+    ambiguous（绝不任选一个位置）。
+    """
+    with read_tx() as conn:
+        source = _get_snapshot_meta(conn, source_snapshot_id)
+        target = conn.execute(
+            "SELECT channel, watermark FROM snapshots WHERE snapshot_id = ?",
+            (target_snapshot_id,),
+        ).fetchone()
+        if target is None:
+            raise SnapshotError(
+                "snapshot_not_found",
+                f"快照 {target_snapshot_id} 不存在",
+                status_code=404,
+            )
+        if target["channel"] != source["channel"]:
+            raise SnapshotError(
+                "snapshot_channel_mismatch",
+                f"源快照 {source_snapshot_id}（频道 {source['channel']}）与目标快照 "
+                f"{target_snapshot_id}（频道 {target['channel']}）不属于同一频道，"
+                "不能迁移引用",
+                status_code=409,
+            )
+
+        rows = conn.execute(
+            """
+            SELECT snapshot_id AS sid, seq, kind, effective_text
+            FROM snapshot_items
+            WHERE snapshot_id IN (?, ?)
+            ORDER BY snapshot_id, seq
+            """,
+            (source_snapshot_id, target_snapshot_id),
+        ).fetchall()
+    source_by_seq = {
+        row["seq"]: row for row in rows if row["sid"] == source_snapshot_id
+    }
+    target_rows = [row for row in rows if row["sid"] == target_snapshot_id]
+
+    quote = _extract_source_quote(
+        source_by_seq, source["watermark"],
+        start_seq, start_offset, end_seq, end_offset,
+    )
+
+    matches = _find_quote_matches(target_rows, quote)
+    result = {
+        "source_snapshot_id": source_snapshot_id,
+        "target_snapshot_id": target_snapshot_id,
+        "channel": source["channel"],
+        "status": None,
+        "source": {
+            "start_seq": start_seq,
+            "start_offset": start_offset,
+            "end_seq": end_seq,
+            "end_offset": end_offset,
+        },
+        "quote": quote,
+        "match": None,
+    }
+    if len(matches) == 1:
+        result["status"] = "found"
+        result["match"] = matches[0]
+    elif not matches:
+        result["status"] = "missing"
+    else:
+        result["status"] = "ambiguous"
+    return result
+
+
+def _invalid_quote_range(message: str) -> SnapshotError:
+    """构造引用区间非法的 422 业务错误。"""
+    return SnapshotError("invalid_quote_range", message, status_code=422)
+
+
+def _extract_source_quote(
+    source_by_seq: dict,
+    source_watermark: int,
+    start_seq: int,
+    start_offset: int,
+    end_seq: int,
+    end_offset: int,
+) -> str:
+    """按序号区间与码点偏移（左闭右开）从源快照冻结生效文本提取引用。
+
+    区间 [start_seq, end_seq] 内每个序号都必须是源快照中的字幕行
+    （超界 / 缺口 / 空洞均拒绝）；start_offset 落在 start_seq 文本内、
+    end_offset 落在 end_seq 文本内（均可等于文本长度）；按首条取后缀、
+    末条取前缀、中间整条拼接后，引用不得为空。
+    """
+    if not (1 <= start_seq <= source_watermark) or not (
+        1 <= end_seq <= source_watermark
+    ):
+        raise _invalid_quote_range(
+            f"引用序号超出源快照水位线 {source_watermark}："
+            f"{start_seq}..{end_seq}"
+        )
+
+    texts = []
+    for seq in range(start_seq, end_seq + 1):
+        row = source_by_seq.get(seq)
+        if row is None or row["kind"] != "subtitle":
+            raise _invalid_quote_range(
+                f"序号 {seq} 在源快照中不是字幕（缺口或缺失），"
+                "引用不得越过缺口"
+            )
+        texts.append(row["effective_text"])
+
+    if not 0 <= start_offset <= len(texts[0]):
+        raise _invalid_quote_range(
+            f"起始偏移 {start_offset} 超出序号 {start_seq} 文本长度 "
+            f"{len(texts[0])}（左闭右开，允许等于文本长度）"
+        )
+    if not 0 <= end_offset <= len(texts[-1]):
+        raise _invalid_quote_range(
+            f"终点偏移 {end_offset} 超出序号 {end_seq} 文本长度 "
+            f"{len(texts[-1])}（左闭右开，允许等于文本长度）"
+        )
+
+    if start_seq == end_seq:
+        if start_offset >= end_offset:
+            raise _invalid_quote_range(
+                "同一字幕内 start_offset 必须小于 end_offset（左闭右开，"
+                "引用不得为空）"
+            )
+        return texts[0][start_offset:end_offset]
+
+    # 跨字幕：首条截取起点之后、末条截取终点之前，中间整条（含可能为空
+    # 的字幕，空字幕仍属于同一连续段）保留；最终拼接为空（如起止偏移都
+    # 为 0，或恰好在字幕边界取了零宽区间）一律拒绝。
+    pieces = [texts[0][start_offset:]]
+    pieces.extend(texts[1:-1])
+    pieces.append(texts[-1][:end_offset])
+    quote = "".join(pieces)
+    if not quote:
+        raise _invalid_quote_range(
+            "按给定序号区间与码点偏移提取出的引用为空，引用不得为空"
+        )
+    return quote
+
+
+def _find_quote_matches(target_rows: list, quote: str) -> list:
+    """在目标快照的连续字幕拼接文本中枚举引用的全部出现（最多保留 2 个）。
+
+    相邻字幕（中间没有缺口）按序号无分隔拼接为一段，缺口截断分段；
+    匹配逐码点、区分大小写，每次命中后只前进一位（重叠出现也枚举）。
+    返回至多 2 个命中的 {start_seq, start_offset, end_seq, end_offset}，
+    调用方据此区分 found（1）/ missing（0）/ ambiguous（>1）。
+    """
+    matches = []
+    segment = []  # [(seq, text), ...]，当前无缺口连续字幕段
+    for row in target_rows:
+        if row["kind"] == "gap":
+            matches.extend(_matches_in_segment(segment, quote, 2 - len(matches)))
+            segment = []
+            if len(matches) >= 2:
+                return matches
+            continue
+        segment.append((row["seq"], row["effective_text"]))
+    matches.extend(_matches_in_segment(segment, quote, 2 - len(matches)))
+    return matches[:2]
+
+
+def _matches_in_segment(segment: list, quote: str, limit: int) -> list:
+    """在一条连续字幕段中枚举至多 limit 个引用命中并映射回序号 / 偏移。"""
+    if not segment or limit <= 0:
+        return []
+    seqs = [seq for seq, _ in segment]
+    texts = [text for _, text in segment]
+    joined = "".join(texts)
+    boundaries = []
+    pos = 0
+    for text in texts:
+        boundaries.append(pos)
+        pos += len(text)
+
+    def locate_start(index: int) -> "tuple[int, int]":
+        """拼接文本码点下标 -> 起点（所属序号, 序号内码点偏移）。
+
+        下标落在某字幕起点上时优先归属该字幕（空字幕重复边界则归属之后
+        第一条非空字幕）——跨字幕边界的命中，其起点确定映射到引用第一
+        个码点所属的字幕。
+        """
+        for j in range(len(seqs) - 1, -1, -1):
+            if boundaries[j] <= index:
+                return seqs[j], index - boundaries[j]
+        return seqs[0], 0
+
+    def locate_end(index: int) -> "tuple[int, int]":
+        """拼接文本码点下标（不含）-> 终点（所属序号, 序号内码点偏移）。
+
+        终点归属于引用最后一个码点（index-1）所在的字幕：取最后一个
+        起点严格小于 index 的字幕，因此恰好落在字幕边界上的终点映射为
+        前一条字幕的文本长度，而不是后一条字幕的偏移 0；前一条为空时
+        继续向前归属（空字幕不占终点）。
+        """
+        for j in range(len(seqs) - 1, -1, -1):
+            if boundaries[j] < index:
+                return seqs[j], index - boundaries[j]
+        return seqs[0], 0
+
+    found = []
+    search_from = 0
+    while len(found) < limit:
+        index = joined.find(quote, search_from)
+        if index < 0:
+            break
+        start_seq_, start_off = locate_start(index)
+        end_seq_, end_off = locate_end(index + len(quote))
+        found.append(
+            {
+                "start_seq": start_seq_,
+                "start_offset": start_off,
+                "end_seq": end_seq_,
+                "end_offset": end_off,
+            }
+        )
+        search_from = index + 1  # 每次只前进一步，重叠出现也被枚举
+    return found
 
 
 # ---------- 命名消费者拉取游标 ----------

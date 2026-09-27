@@ -26,6 +26,8 @@ from .schemas import (
     FragmentIn,
     GapDecisionIn,
     GapDecisionResponse,
+    QuoteMigrationIn,
+    QuoteMigrationResponse,
     RedactionIn,
     SnapshotCorrectionsResponse,
     SnapshotCreateIn,
@@ -48,8 +50,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Live Subtitle Finalizer",
     summary="直播字幕定稿服务：乱序片段缓冲、按连续前缀推进水位线并定稿；"
-    "支持追加式更正、不可变发布快照、快照敏感词遮盖、剪辑字幕导出与命名消费者拉取游标",
-    version="1.6.0",
+    "支持追加式更正、不可变发布快照、快照差异、快照敏感词遮盖、"
+    "剪辑字幕导出、快照字幕引用迁移与命名消费者拉取游标",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -342,6 +345,43 @@ def export_snapshot_edit(
             media_type="text/vtt",
         )
     return result
+
+
+@app.post(
+    "/snapshots/{snapshot_id}/quote-migrations",
+    response_model=QuoteMigrationResponse,
+    responses={
+        404: {"description": "源快照或目标快照不存在", "model": ErrorResponse},
+        409: {"description": "源快照与目标快照分属不同频道", "model": ErrorResponse},
+        422: {
+            "description": (
+                "请求体校验失败，或源引用序号 / 码点偏移无效"
+                "（越界、越过缺口、偏移越界、引用为空等 invalid_quote_range）"
+            ),
+            "model": ErrorResponse,
+        },
+    },
+)
+def migrate_snapshot_quote(snapshot_id: str, body: QuoteMigrationIn) -> dict:
+    """把源快照中的一段非空引用迁移定位到目标快照（只读，不修改任何快照或字幕）。
+
+    - 请求体携带 target_snapshot_id 及源引用的起止序号 / Unicode 码点
+      偏移（终点不含）；按源快照冻结的生效文本提取引用，引用可跨相邻
+      字幕但不得越过缺口；序号或偏移无效、引用为空返回 422
+      invalid_quote_range；
+    - 仅允许同频道快照：任一快照不存在 404，频道不一致 409；
+    - 在目标快照的连续字幕文本（相邻字幕无分隔拼接、缺口阻断）中逐码点
+      查找完整引用：恰好一次返回 found 及对应起止序号 / 偏移，零次返回
+      missing，多次返回 ambiguous（绝不任选一个位置）。
+    """
+    return service.migrate_snapshot_quote(
+        snapshot_id,
+        body.target_snapshot_id,
+        body.start_seq,
+        body.start_offset,
+        body.end_seq,
+        body.end_offset,
+    )
 
 
 # ---------- 命名消费者拉取游标 ----------

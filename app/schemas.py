@@ -516,6 +516,84 @@ class EditExportResponse(BaseModel):
     )
 
 
+# ---------- 快照字幕引用迁移 ----------
+
+
+class QuoteRange(BaseModel):
+    """一段字幕文本范围：序号区间（含两端）+ 序号内码点偏移（左闭右开）。"""
+
+    start_seq: int = Field(..., ge=1, description="起始字幕序号（含）")
+    start_offset: int = Field(
+        ..., ge=0, description="起始字幕内的起始 Unicode 码点偏移（含，从 0 起）"
+    )
+    end_seq: int = Field(..., ge=1, description="结束字幕序号（含）")
+    end_offset: int = Field(
+        ..., ge=0, description="结束字幕内的终点 Unicode 码点偏移（不含，允许等于文本码点长度）"
+    )
+
+    @model_validator(mode="after")
+    def _end_not_before_start(self) -> "QuoteRange":
+        if self.end_seq < self.start_seq:
+            raise ValueError("end_seq 不得小于 start_seq")
+        if self.end_seq == self.start_seq and self.end_offset < self.start_offset:
+            raise ValueError("同一字幕内 end_offset 不得小于 start_offset（左闭右开）")
+        return self
+
+
+class QuoteMigrationIn(BaseModel):
+    target_snapshot_id: str = Field(
+        ...,
+        min_length=1,
+        description="目标快照 ID（UUID）：引用将在该快照中重新定位，须与源快照同频道",
+    )
+    start_seq: int = Field(..., ge=1, description="源引用起始字幕序号（含）")
+    start_offset: int = Field(
+        ..., ge=0, description="源引用在起始字幕内的起始 Unicode 码点偏移（含，从 0 起）"
+    )
+    end_seq: int = Field(..., ge=1, description="源引用结束字幕序号（含），可与起始相同")
+    end_offset: int = Field(
+        ..., ge=0, description="源引用在结束字幕内的终点 Unicode 码点偏移（不含，允许等于文本码点长度）"
+    )
+
+    @model_validator(mode="after")
+    def _end_not_before_start(self) -> "QuoteMigrationIn":
+        if self.end_seq < self.start_seq:
+            raise ValueError("end_seq 不得小于 start_seq")
+        if self.end_seq == self.start_seq and self.end_offset < self.start_offset:
+            raise ValueError("同一字幕内 end_offset 不得小于 start_offset（左闭右开）")
+        return self
+
+    @field_validator("target_snapshot_id")
+    @classmethod
+    def _strip_and_require_nonblank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("不得为空白字符串")
+        return v
+
+
+class QuoteMigrationResponse(BaseModel):
+    source_snapshot_id: str = Field(..., description="源快照 ID（路径参数）")
+    target_snapshot_id: str = Field(..., description="目标快照 ID（请求体）")
+    channel: str = Field(..., description="两个快照共同所属的频道")
+    status: Literal["found", "missing", "ambiguous"] = Field(
+        ...,
+        description=(
+            "迁移结果：found=引用在目标快照中恰好命中一次；missing=零次命中；"
+            "ambiguous=多次命中（不任选位置）"
+        ),
+    )
+    source: QuoteRange = Field(..., description="请求给出的源引用序号 / 偏移（原样回显）")
+    quote: str = Field(..., description="按源快照冻结生效文本提取出的非空引用（连续字幕无分隔拼接）")
+    match: Optional[QuoteRange] = Field(
+        None,
+        description=(
+            "status=found 时引用在目标快照中的起止序号 / 码点偏移（命中可跨相邻字幕）；"
+            "missing / ambiguous 时为 null"
+        ),
+    )
+
+
 # ---------- 命名消费者拉取游标 ----------
 
 
