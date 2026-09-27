@@ -75,6 +75,19 @@
 - cue 按 (start_ms, clip_index, seq) 升序返回；format=vtt 时渲染为
   合法 WebVTT，正文转义 & < >。
 
+快照字幕引用迁移（migrate_snapshot_quote）不变式：
+- 迁移是纯只读计算：只读取两份快照冻结的生效文本，快照表与定稿 /
+  更正原表均不被修改，重复调用结果一致；
+- 引用由源快照的起止字幕序号与 Unicode 码点偏移（终点不含）界定：
+  区间内每个序号都必须是字幕（引用不得越过缺口），偏移不得超出对应
+  字幕的码点长度，提取出的引用必须非空；任一不满足即拒绝（422）且
+  不产生任何写入；源 / 目标快照不存在 -> 404，分属不同频道 -> 409；
+- 查找在目标快照 1..watermark 上进行：相邻字幕（中间无缺口）按序号
+  无分隔拼接，缺口阻断拼接——命中可跨字幕但绝不跨缺口；匹配逐码点、
+  区分大小写、不做归一化，重叠命中全部计数；
+- 恰好一处命中返回 found 与目标起止序号 / 偏移；零次命中返回
+  missing；多处命中返回 ambiguous 与命中次数，不任选任何一个位置。
+
 命名消费者拉取游标（consumers）不变式：
 - 每个 (channel, consumer) 的 cursor 只能经确认接口单调推进，且只能
   推进到当前租约批次 [lease_from, lease_to] 内的序号；
@@ -1488,6 +1501,218 @@ def _vtt_timestamp(ms: int) -> str:
 def _escape_vtt_text(text: str) -> str:
     """WebVTT 正文转义：& < > 替换为实体，避免被解析为标记或时间戳箭头。"""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# ---------- 快照字幕引用迁移 ----------
+
+
+def migrate_snapshot_quote(
+    source_snapshot_id: str,
+    target_snapshot_id: str,
+    start_seq: int,
+    start_offset: int,
+    end_seq: int,
+    end_offset: int,
+) -> dict:
+    """把源快照中的一段字幕引用迁移定位到目标快照（纯只读）。
+
+    引用由源快照的起止字幕序号与 Unicode 码点偏移（终点不含）界定，
+    按源快照冻结的生效文本提取：可跨相邻字幕，但区间内不得有缺口；
+    序号越界、落在缺口、偏移越界或提取结果为空都拒绝（422）。随后在
+    目标快照的连续字幕文本（相邻字幕无分隔拼接、缺口阻断）中逐码点
+    精确查找完整引用：恰好一处命中返回 found 及目标起止序号与偏移，
+    零次命中返回 missing，多处命中返回 ambiguous（不任选其一）。
+    快照与当前定稿 / 更正均不被修改。
+    """
+    with read_tx() as conn:
+        source = _get_snapshot_meta(conn, source_snapshot_id)
+        target = conn.execute(
+            "SELECT channel, watermark FROM snapshots WHERE snapshot_id = ?",
+            (target_snapshot_id,),
+        ).fetchone()
+        if target is None:
+            raise SnapshotError(
+                "snapshot_not_found",
+                f"目标快照 {target_snapshot_id} 不存在",
+                status_code=404,
+            )
+        if target["channel"] != source["channel"]:
+            raise SnapshotError(
+                "snapshot_channel_mismatch",
+                f"源快照 {source_snapshot_id}（频道 {source['channel']}）与目标快照 "
+                f"{target_snapshot_id}（频道 {target['channel']}）不属于同一频道，"
+                "不能迁移引用",
+                status_code=409,
+            )
+
+        quote = _extract_quote(
+            conn,
+            source_snapshot_id,
+            source["watermark"],
+            start_seq,
+            start_offset,
+            end_seq,
+            end_offset,
+        )
+        target_rows = conn.execute(
+            "SELECT seq, kind, effective_text FROM snapshot_items "
+            "WHERE snapshot_id = ? ORDER BY seq",
+            (target_snapshot_id,),
+        ).fetchall()
+
+    matches = _find_quote_matches(target_rows, quote)
+    if len(matches) == 1:
+        status, match = "found", matches[0]
+    elif not matches:
+        status, match = "missing", None
+    else:
+        # 多处命中：只报告次数，不任选任何一个位置
+        status, match = "ambiguous", None
+    return {
+        "source_snapshot_id": source_snapshot_id,
+        "target_snapshot_id": target_snapshot_id,
+        "channel": source["channel"],
+        "quote": quote,
+        "status": status,
+        "match_count": len(matches),
+        "match": match,
+    }
+
+
+def _extract_quote(
+    conn,
+    snapshot_id: str,
+    watermark: int,
+    start_seq: int,
+    start_offset: int,
+    end_seq: int,
+    end_offset: int,
+) -> str:
+    """按起止序号与码点偏移（终点不含）从源快照冻结生效文本中提取引用。
+
+    区间内每个序号都必须是字幕（不得越过缺口），偏移不得超出对应字幕
+    的码点长度，提取结果必须非空；否则抛 422，不产生任何写入。
+    """
+    if start_seq < 1 or start_seq > end_seq:
+        # 防御性检查：HTTP 层 schema 已保证 1 <= start_seq <= end_seq
+        raise SnapshotError(
+            "quote_seq_invalid",
+            f"引用区间无效：start_seq={start_seq}、end_seq={end_seq}",
+            status_code=422,
+        )
+    if end_seq > watermark:
+        raise SnapshotError(
+            "quote_seq_out_of_snapshot",
+            f"引用区间 {start_seq}..{end_seq} 超出源快照 {snapshot_id} "
+            f"的水位线 {watermark}",
+            status_code=422,
+        )
+
+    rows = conn.execute(
+        "SELECT seq, kind, effective_text FROM snapshot_items "
+        "WHERE snapshot_id = ? AND seq BETWEEN ? AND ? ORDER BY seq",
+        (snapshot_id, start_seq, end_seq),
+    ).fetchall()
+    texts = {}
+    for row in rows:
+        if row["kind"] == "gap":
+            raise SnapshotError(
+                "quote_crosses_gap",
+                f"序号 {row['seq']} 在源快照 {snapshot_id} 中是永久缺口，"
+                "引用不得越过缺口",
+                status_code=422,
+            )
+        texts[row["seq"]] = row["effective_text"]
+
+    first, last = texts[start_seq], texts[end_seq]
+    if (
+        start_offset > len(first)
+        or end_offset > len(last)
+        or (start_seq == end_seq and start_offset > end_offset)
+    ):
+        raise SnapshotError(
+            "quote_offset_out_of_range",
+            f"码点偏移越界：起点字幕 {start_seq} 长 {len(first)}、"
+            f"终点字幕 {end_seq} 长 {len(last)}，收到偏移 "
+            f"{start_offset}..{end_offset}（终点不含）",
+            status_code=422,
+        )
+
+    if start_seq == end_seq:
+        quote = first[start_offset:end_offset]
+    else:
+        parts = [first[start_offset:]]
+        parts.extend(texts[seq] for seq in range(start_seq + 1, end_seq))
+        parts.append(last[:end_offset])
+        quote = "".join(parts)
+    if not quote:
+        raise SnapshotError(
+            "empty_quote",
+            "按给定起止序号与偏移提取的引用为空，请调整范围",
+            status_code=422,
+        )
+    return quote
+
+
+def _find_quote_matches(rows: list, quote: str) -> list:
+    """在目标快照条目中查找完整引用，返回全部命中的起止序号与偏移。
+
+    相邻字幕（中间无缺口）按序号无分隔拼接成分段，缺口阻断拼接；在每
+    段内枚举全部（含重叠）命中，并把命中区间映射回目标快照的起止
+    (seq, offset)。
+    """
+    matches = []
+    segment_seqs = []
+    segment_texts = []
+
+    def flush():
+        if not segment_seqs:
+            return
+        joined = "".join(segment_texts)
+        start = 0
+        while True:
+            index = joined.find(quote, start)
+            if index < 0:
+                break
+            matches.append(
+                _locate_quote(segment_seqs, segment_texts, index, len(quote))
+            )
+            start = index + 1  # 每次只前进一步，重叠命中也被枚举
+        segment_seqs.clear()
+        segment_texts.clear()
+
+    for row in rows:
+        if row["kind"] == "gap":
+            flush()
+            continue
+        segment_seqs.append(row["seq"])
+        segment_texts.append(row["effective_text"])
+    flush()
+    return matches
+
+
+def _locate_quote(seqs: list, texts: list, hit_start: int, quote_len: int) -> dict:
+    """把拼接段内的命中区间 [hit_start, hit_start+quote_len) 映射回起止序号与偏移。
+
+    起点落在包含首码点的字幕上，终点（不含）落在包含末码点的字幕上；
+    空字幕不含任何码点，不会成为命中边界。
+    """
+    hit_end = hit_start + quote_len  # 终点不含
+    base = 0
+    start_point = end_point = None
+    for seq, text in zip(seqs, texts):
+        next_base = base + len(text)
+        if start_point is None and base <= hit_start < next_base:
+            start_point = (seq, hit_start - base)
+        if end_point is None and base < hit_end <= next_base:
+            end_point = (seq, hit_end - base)
+        base = next_base
+    return {
+        "start_seq": start_point[0],
+        "start_offset": start_point[1],
+        "end_seq": end_point[0],
+        "end_offset": end_point[1],
+    }
 
 
 # ---------- 命名消费者拉取游标 ----------
